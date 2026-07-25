@@ -247,27 +247,90 @@ def load_model_in_background():
         except AttributeError:
             pass  # older torch versions without safe_globals support
 
-        # Free tier has 512MB RAM total, which is tight for torch + transformers
-        # + a 227MB checkpoint. Keep peak memory down by discarding the raw
-        # checkpoint dict as soon as we've pulled the state_dict out of it,
-        # and forcing a GC pass before/after the heaviest allocations.
+        # Free tier has 512MB RAM total, which is tight for torch + a 227MB
+        # checkpoint. Two changes here cut peak memory substantially:
+        #
+        # 1. mmap=True: instead of reading the whole file into a RAM buffer
+        #    and then unpickling it, torch memory-maps the file so tensor
+        #    data is paged in from disk on demand rather than fully
+        #    materialized in process memory up front.
+        #
+        # 2. Constructing the model on the "meta" device: nn.Module.__init__
+        #    normally allocates real memory for every parameter immediately,
+        #    even though we're about to overwrite all of it via load_state_dict.
+        #    Building on "meta" first means those parameters exist only as
+        #    shape/dtype metadata (no real storage), so we never hold both a
+        #    freshly-initialized copy AND the checkpoint's copy in RAM at once.
         import gc
         gc.collect()
 
-        checkpoint = torch.load(MODEL_PATH, map_location=config.device, weights_only=False)
+        try:
+            checkpoint = torch.load(MODEL_PATH, map_location=config.device, weights_only=False, mmap=True)
+        except TypeError:
+            # mmap= not supported on this torch version — fall back to normal load
+            checkpoint = torch.load(MODEL_PATH, map_location=config.device, weights_only=False)
         state_dict = checkpoint["model_state_dict"] if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint else checkpoint
         del checkpoint
         gc.collect()
 
-        model = SmallLM(config).to(config.device)
-        # assign=True makes load_state_dict swap tensors in directly instead of
-        # copying into pre-allocated ones, avoiding a moment where both the
-        # freshly-initialized weights and the checkpoint's weights exist at once.
         try:
-            model.load_state_dict(state_dict, assign=True)
-        except TypeError:
-            # older torch versions without the assign= kwarg
-            model.load_state_dict(state_dict)
+            with torch.device("meta"):
+                model = SmallLM(config)
+            # strict=False so a checkpoint missing buffer keys (mask/inv_freq)
+            # doesn't hard-crash here — the fallback logic below regenerates
+            # those specific buffers deterministically instead.
+            model.load_state_dict(state_dict, assign=True, strict=False)
+
+            # RoPE's inv_freq and the causal mask are registered buffers that
+            # may not be present in an older checkpoint's state_dict (some
+            # training scripts only save learnable parameters, not buffers).
+            # If any buffer is still a meta tensor at this point, it has no
+            # real storage. IMPORTANT: we fix these by calling register_buffer
+            # directly with a real tensor for just that buffer — we do NOT
+            # call model.to_empty(), because to_empty() reallocates storage
+            # for every tensor in the module, silently overwriting the
+            # correctly-loaded checkpoint weights with uninitialized garbage
+            # even though load_state_dict already populated them correctly.
+            still_meta = [n for n, b in model.named_buffers() if b.is_meta]
+            for name in still_meta:
+                *parent_path, leaf = name.split(".")
+                parent = model
+                for p in parent_path:
+                    parent = getattr(parent, p)
+                if leaf == "inv_freq":
+                    dim = parent.dim
+                    real = 1.0 / (10000 ** (torch.arange(0, dim, 2).float() / dim))
+                elif leaf == "mask":
+                    cl = config.context_length
+                    real = torch.triu(torch.ones(cl, cl), diagonal=1).bool()
+                else:
+                    continue  # unknown buffer — nothing we can safely regenerate
+                parent.register_buffer(leaf, real.to(config.device))
+
+            # Any leftover meta *parameters* (as opposed to buffers) would mean
+            # load_state_dict didn't actually cover something it should have —
+            # that's a real mismatch between the checkpoint and this
+            # architecture, not something safe to paper over. Fail loudly
+            # rather than silently running with garbage weights.
+            meta_params = [n for n, p in model.named_parameters() if p.is_meta]
+            if meta_params:
+                raise RuntimeError(
+                    f"Checkpoint is missing required parameters: {meta_params}. "
+                    "This checkpoint doesn't match the model architecture."
+                )
+
+            model = model.to(config.device)
+        except (TypeError, NotImplementedError, RuntimeError) as e:
+            if "missing required parameters" in str(e):
+                raise  # real architecture mismatch — don't mask this, surface it
+            # meta-device construction unsupported/unavailable on this torch
+            # version — fall back to the straightforward (higher peak-memory) path
+            model = SmallLM(config).to(config.device)
+            try:
+                model.load_state_dict(state_dict, assign=True)
+            except TypeError:
+                model.load_state_dict(state_dict)
+
         del state_dict
         gc.collect()
         model.eval()
