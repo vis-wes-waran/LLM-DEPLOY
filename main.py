@@ -10,7 +10,7 @@ import torch
 torch.set_num_threads(1)  # free tier gives ~0.15 CPU; more threads just adds overhead
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers import AutoTokenizer
+import tiktoken
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -51,6 +51,7 @@ class ModelState:
         self.error = None
         self.model = None
         self.tokenizer = None
+        self.eos_token_id = None
 
 state = ModelState()
 
@@ -233,8 +234,8 @@ def load_model_in_background():
 
         state.status = "loading"
         state.detail = "Loading tokenizer..."
-        tokenizer = AutoTokenizer.from_pretrained("gpt2")
-        tokenizer.pad_token = tokenizer.eos_token
+        tokenizer = tiktoken.get_encoding("gpt2")
+        eos_token_id = tokenizer.eot_token  # tiktoken's GPT-2 encoding: id 50256, same as HF's eos/pad token
 
         state.detail = "Loading model weights into memory..."
         # Belt-and-suspenders: the sys.modules alias above should already make
@@ -273,6 +274,7 @@ def load_model_in_background():
 
         state.model = model
         state.tokenizer = tokenizer
+        state.eos_token_id = eos_token_id
         state.status = "ready"
         state.detail = "Model ready."
     except Exception as e:
@@ -327,7 +329,8 @@ async def generate_stream(req: GenerateRequest):
         model = state.model
         tokenizer = state.tokenizer
         prompt = build_prompt(req.instruction, req.input_text)
-        input_ids = tokenizer.encode(prompt, return_tensors="pt").to(config.device)
+        token_ids = tokenizer.encode(prompt, allowed_special="all")
+        input_ids = torch.tensor([token_ids], dtype=torch.long).to(config.device)
 
         max_tokens = min(max(req.max_tokens, 1), 512)
 
@@ -337,10 +340,10 @@ async def generate_stream(req: GenerateRequest):
                 max_new_tokens=max_tokens,
                 temperature=req.temperature,
                 top_k=req.top_k,
-                eos_token_id=tokenizer.eos_token_id,
+                eos_token_id=state.eos_token_id,
             )
             for token_id in token_gen:
-                piece = tokenizer.decode([token_id], skip_special_tokens=True)
+                piece = tokenizer.decode([token_id])
                 yield f"data: {json.dumps({'type': 'token', 'text': piece})}\n\n"
                 await asyncio.sleep(0)  # yield control so the response actually flushes
             yield f"data: {json.dumps({'type': 'done'})}\n\n"
