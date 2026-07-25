@@ -7,6 +7,7 @@ import asyncio
 
 import gdown
 import torch
+torch.set_num_threads(1)  # free tier gives ~0.15 CPU; more threads just adds overhead
 import torch.nn as nn
 import torch.nn.functional as F
 from transformers import AutoTokenizer
@@ -244,11 +245,30 @@ def load_model_in_background():
             torch.serialization.add_safe_globals([Config])
         except AttributeError:
             pass  # older torch versions without safe_globals support
+
+        # Free tier has 512MB RAM total, which is tight for torch + transformers
+        # + a 227MB checkpoint. Keep peak memory down by discarding the raw
+        # checkpoint dict as soon as we've pulled the state_dict out of it,
+        # and forcing a GC pass before/after the heaviest allocations.
+        import gc
+        gc.collect()
+
         checkpoint = torch.load(MODEL_PATH, map_location=config.device, weights_only=False)
         state_dict = checkpoint["model_state_dict"] if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint else checkpoint
+        del checkpoint
+        gc.collect()
 
         model = SmallLM(config).to(config.device)
-        model.load_state_dict(state_dict)
+        # assign=True makes load_state_dict swap tensors in directly instead of
+        # copying into pre-allocated ones, avoiding a moment where both the
+        # freshly-initialized weights and the checkpoint's weights exist at once.
+        try:
+            model.load_state_dict(state_dict, assign=True)
+        except TypeError:
+            # older torch versions without the assign= kwarg
+            model.load_state_dict(state_dict)
+        del state_dict
+        gc.collect()
         model.eval()
 
         state.model = model
